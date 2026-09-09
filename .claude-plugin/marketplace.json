@@ -1,0 +1,16 @@
+{
+  "name": "slotnikov-tools",
+  "owner": {
+    "name": "Sergey Lotnikov",
+    "email": "18272061+lotnikov@users.noreply.github.com",
+    "url": "https://github.com/lotnikov"
+  },
+  "plugins": [
+    {
+      "name": "terminal-tint",
+      "source": "./terminal-tint",
+      "description": "Give every concurrent Claude Code window its own terminal background colour.",
+      "version": "1.0.0"
+    }
+  ]
+}
