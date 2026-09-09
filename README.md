@@ -63,3 +63,7 @@ near-black — replace them with twelve pale tints instead.
 Escape sequences go straight to the terminal device (`/dev/pts/N`), not to
 stdout: Claude Code captures `SessionStart` stdout and feeds it into the model's
 context, so anything printed there would never reach the screen.
+
+## License
+
+[MIT](LICENSE)

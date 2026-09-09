@@ -2,6 +2,7 @@
   "name": "terminal-tint",
   "description": "Give every concurrent Claude Code window its own terminal background colour, derived from the project directory (or the session id when two windows share a directory), and restore the original colour on exit.",
   "version": "1.0.0",
+  "license": "MIT",
   "author": {
     "name": "Sergey Lotnikov",
     "email": "18272061+lotnikov@users.noreply.github.com",
