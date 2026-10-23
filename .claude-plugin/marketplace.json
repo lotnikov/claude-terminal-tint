@@ -9,8 +9,8 @@
     {
       "name": "terminal-tint",
       "source": "./terminal-tint",
-      "description": "Give every concurrent Claude Code window its own terminal background colour.",
-      "version": "1.0.0"
+      "description": "Give every concurrent Claude Code window its own terminal background colour, plus a matching panel badge on Cinnamon.",
+      "version": "1.1.0"
     }
   ]
 }
