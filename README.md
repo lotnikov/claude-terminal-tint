@@ -1,7 +1,9 @@
 # terminal-tint
 
 A Claude Code plugin that gives every concurrent Claude window its own terminal
-background colour, so you can tell at a glance which window is which task.
+background colour, so you can tell at a glance which window is which task. On the
+Cinnamon desktop the same colour also appears as a badge on the window's button
+in the panel, so you can find the right window before you switch to it.
 
 ## Install
 
@@ -33,9 +35,39 @@ install from is not tinted.
 - On exit the entry is removed and OSC 111 resets the background to your
   terminal profile's own colour.
 
+## Panel badge (Cinnamon)
+
+On Cinnamon under X11 each terminal window's button in the panel gets a dot in
+the session's colour — the same hue as the background, lifted in lightness so it
+stays visible on a dark panel.
+
+- **One badge per window.** Several tabs share one panel button, so the first
+  session in a window owns the badge and later tabs leave it alone. When the
+  owner exits, the badge passes to the longest-running session still in that
+  window; when the last one exits, the normal icon comes back.
+- **Finding the window.** GNOME Terminal runs all windows in one process and
+  exports no `WINDOWID`, so the hook briefly gives the tab a unique title, finds
+  the X window carrying it, and restores the previous title with the xterm title
+  stack (`CSI 22;0t` / `CSI 23;0t`). Only the active tab sets the window title,
+  so a session started in a background tab gets no badge (and waits 1.5 s
+  looking for it).
+- **Publishing the icon.** The badge is a cached PNG in
+  `~/.claude/hooks/state/terminal-badges/`, set through the XApp
+  `_NET_WM_XAPP_ICON_NAME` window property, which Cinnamon prefers over the
+  application icon. The panel only re-reads icons when `_NET_WM_ICON` changes, so
+  the hook appends zero items to it: the icon data is untouched but the X server
+  still sends the change notification.
+- **Needs** the grouped window list with *Group windows by application* turned
+  off (one button per window), `python3-xlib`, ImageMagick (`convert` or
+  `magick`) and PyGObject to look up the terminal icon. Without any of them, or
+  on Wayland or macOS, the badge is skipped silently and only the background is
+  tinted.
+- A tab dragged into another window leaves its badge on the old window.
+
 ## Requirements
 
-- **`python3`** on `PATH`. No third-party packages, no `jq`.
+- **`python3`** on `PATH`. The background tint needs no third-party packages
+  and no `jq`; the optional panel badge has its own needs, listed above.
 - **A terminal that honours OSC 11.** Verified on GNOME Terminal (VTE 0.76).
   kitty, WezTerm, Alacritty, iTerm2, Konsole and foot support it too; Apple's
   Terminal.app does not. To check yours:
@@ -57,6 +89,9 @@ The palette is `BACKGROUND_COLOUR_PALETTE` at the top of
 luminance band, chosen so a dark theme's foreground colours and Claude Code's
 syntax highlighting stay readable. On a **light** theme they will all read as
 near-black — replace them with twelve pale tints instead.
+
+The badge colour is derived from the background by `BADGE_LIGHTNESS` and
+`BADGE_MINIMUM_SATURATION` in the same file.
 
 ## Why a hook and not a setting
 

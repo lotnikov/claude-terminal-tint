@@ -1,7 +1,7 @@
 {
   "name": "terminal-tint",
-  "description": "Give every concurrent Claude Code window its own terminal background colour, derived from the project directory (or the session id when two windows share a directory), and restore the original colour on exit.",
-  "version": "1.0.0",
+  "description": "Give every concurrent Claude Code window its own terminal background colour, derived from the project directory (or the session id when two windows share a directory), restore the original colour on exit, and on Cinnamon show the same colour as a badge on the window's panel button.",
+  "version": "1.1.0",
   "license": "MIT",
   "author": {
     "name": "Sergey Lotnikov",
@@ -14,6 +14,9 @@
     "colour",
     "osc11",
     "hooks",
-    "ergonomics"
+    "ergonomics",
+    "cinnamon",
+    "panel",
+    "badge"
   ]
 }

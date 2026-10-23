@@ -22,14 +22,35 @@ Requires a terminal that honours OSC 11. To check yours, run:
 
     printf '\033]11;#2b1b3d\007'   # tint
     printf '\033]111\033\\'        # reset
+
+The same colour is also shown as a badge on the terminal window's button in the
+Cinnamon panel (grouped-window-list with "group apps" off, so every window has
+its own button):
+
+  * The X window is found by briefly giving the tab a unique title (saved and
+    restored with the xterm title stack, CSI 22/23 t) and looking for it among
+    the managed windows.
+  * The badge is a cached PNG (terminal icon + coloured dot) published through
+    the XApp _NET_WM_XAPP_ICON_NAME window property, which Cinnamon prefers over
+    the application icon. The panel only re-reads icons on a _NET_WM_ICON change,
+    so a zero-length append to that property is used as a nudge.
+  * Several tabs of one window share one button, so the first session in a
+    window owns the badge and later ones leave it alone. When the owner ends,
+    the badge passes to another live session in that window, or is removed.
 """
 
 from __future__ import annotations
 
+import colorsys
+import fcntl
 import json
 import os
+import shutil
 import subprocess
 import sys
+import time
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Final, Iterator, NamedTuple
 
@@ -58,6 +79,22 @@ SESSION_REGISTRY_DIRECTORY: Final[Path] = (
     / "terminal-bg"
 )
 
+BADGE_ICON_CACHE_DIRECTORY: Final[Path] = SESSION_REGISTRY_DIRECTORY.parent / "terminal-badges"
+REGISTRY_LOCK_FILE_PATH: Final[Path] = SESSION_REGISTRY_DIRECTORY.parent / "terminal-bg.lock"
+
+# Icon the badge is drawn on, looked up in the current icon theme (first hit wins).
+TERMINAL_ICON_THEME_NAMES: Final[tuple[str, ...]] = ("org.gnome.Terminal", "utilities-terminal")
+BADGE_ICON_SIZE_PIXELS: Final[int] = 64
+
+# The backgrounds are deliberately dark; a dot that dark would vanish on the
+# panel, so the badge keeps the hue but is lifted to this lightness/saturation.
+BADGE_LIGHTNESS: Final[float] = 0.62
+BADGE_MINIMUM_SATURATION: Final[float] = 0.70
+
+# How long to wait for the marker title to reach the X window, polled in steps.
+WINDOW_SEARCH_TIMEOUT_SECONDS: Final[float] = 1.5
+WINDOW_SEARCH_POLL_INTERVAL_SECONDS: Final[float] = 0.05
+
 # Linux allocates UNIX98 pseudo-terminals across these character-device majors.
 PSEUDO_TERMINAL_MAJOR_RANGE: Final[range] = range(136, 144)
 
@@ -73,6 +110,10 @@ class RegisteredSession(NamedTuple):
     working_directory: str
     colour_hex: str
     colour_source: str  # "cwd" or "session"
+    # Entries written before the panel badge existed lack the fields below.
+    window_id: int | None = None
+    owns_badge: bool = False
+    started_at: float = 0.0
 
 
 class AncestorProcess(NamedTuple):
@@ -282,12 +323,16 @@ def load_registry(excluding_session_id: str) -> list[RegisteredSession]:
     for entry_path in SESSION_REGISTRY_DIRECTORY.glob("*.json"):
         try:
             entry_fields = json.loads(entry_path.read_text())
+            stored_window_id = entry_fields.get("window_id")
             registered = RegisteredSession(
                 session_id=str(entry_fields["session_id"]),
                 claude_process_id=int(entry_fields["claude_process_id"]),
                 working_directory=str(entry_fields["working_directory"]),
                 colour_hex=str(entry_fields["colour_hex"]),
                 colour_source=str(entry_fields["colour_source"]),
+                window_id=int(stored_window_id) if stored_window_id is not None else None,
+                owns_badge=bool(entry_fields.get("owns_badge", False)),
+                started_at=float(entry_fields.get("started_at", 0.0)),
             )
         except (OSError, ValueError, KeyError, TypeError):
             entry_path.unlink(missing_ok=True)
@@ -342,37 +387,320 @@ def choose_colour(
     return BACKGROUND_COLOUR_PALETTE[session_colour_index][1], "session"
 
 
+@contextmanager
+def registry_lock() -> Iterator[None]:
+    """Serialise registry updates so two tabs starting together cannot both
+    decide they are the first session in a window."""
+    REGISTRY_LOCK_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(REGISTRY_LOCK_FILE_PATH, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def save_registry_entry(registered: RegisteredSession, terminal_device_path: str | None) -> None:
+    SESSION_REGISTRY_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    entry_fields = registered._asdict()
+    entry_fields["terminal_device_path"] = terminal_device_path
+    (SESSION_REGISTRY_DIRECTORY / f"{registered.session_id}.json").write_text(
+        json.dumps(entry_fields, indent=2)
+    )
+
+
+def mark_badge_owner(session_id: str) -> None:
+    """Flip owns_badge on another session's entry, keeping its other fields as stored."""
+    entry_path = SESSION_REGISTRY_DIRECTORY / f"{session_id}.json"
+    try:
+        entry_fields = json.loads(entry_path.read_text())
+    except (OSError, ValueError):
+        return
+    entry_fields["owns_badge"] = True
+    entry_path.write_text(json.dumps(entry_fields, indent=2))
+
+
+def read_own_registry_entry(session_id: str) -> RegisteredSession | None:
+    """Read this session's entry without the liveness filtering of load_registry."""
+    try:
+        entry_fields = json.loads((SESSION_REGISTRY_DIRECTORY / f"{session_id}.json").read_text())
+        stored_window_id = entry_fields.get("window_id")
+        return RegisteredSession(
+            session_id=session_id,
+            claude_process_id=int(entry_fields["claude_process_id"]),
+            working_directory=str(entry_fields["working_directory"]),
+            colour_hex=str(entry_fields["colour_hex"]),
+            colour_source=str(entry_fields["colour_source"]),
+            window_id=int(stored_window_id) if stored_window_id is not None else None,
+            owns_badge=bool(entry_fields.get("owns_badge", False)),
+            started_at=float(entry_fields.get("started_at", 0.0)),
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Cinnamon panel badge
+# ---------------------------------------------------------------------------
+
+
+def open_x_display():  # -> Xlib.display.Display | None
+    """Connect to the X server, or return None when there is no usable X11."""
+    if not os.environ.get("DISPLAY"):
+        return None
+    try:
+        from Xlib import display as xlib_display
+
+        return xlib_display.Display()
+    except Exception:
+        return None  # python3-xlib missing, Wayland session, or no server.
+
+
+def window_title(x_display, window_id: int) -> str | None:
+    from Xlib import X
+
+    window = x_display.create_resource_object("window", window_id)
+    try:
+        title_property = window.get_full_property(
+            x_display.intern_atom("_NET_WM_NAME"), X.AnyPropertyType
+        )
+    except Exception:
+        return None  # Window vanished between listing and reading.
+    if title_property is None:
+        return None
+    raw_title = title_property.value
+    return raw_title.decode("utf-8", "replace") if isinstance(raw_title, bytes) else str(raw_title)
+
+
+def managed_window_ids(x_display) -> list[int]:
+    """Top-level windows the window manager reports (_NET_CLIENT_LIST)."""
+    from Xlib import X
+
+    client_list_property = x_display.screen().root.get_full_property(
+        x_display.intern_atom("_NET_CLIENT_LIST"), X.AnyPropertyType
+    )
+    return list(client_list_property.value) if client_list_property is not None else []
+
+
+def window_exists(x_display, window_id: int) -> bool:
+    return window_id in managed_window_ids(x_display)
+
+
+def locate_terminal_window(x_display, terminal_device_path: str | None) -> int | None:
+    """Find the X window that shows our tab.
+
+    gnome-terminal runs every window in one server process and exports no
+    WINDOWID, so the tab is tagged with a unique title and the window is found
+    by that title. Only the active tab drives the window title, which is the
+    tab `claude` was just started from in practice; otherwise this gives up.
+    """
+    if terminal_device_path is None:
+        return None
+
+    marker_title = f"claude-badge-{uuid.uuid4().hex}"
+    # CSI 22;0 t pushes the current title, CSI 23;0 t pops it back afterwards.
+    write_to_terminal(terminal_device_path, f"\033[22;0t\033]2;{marker_title}\007")
+    try:
+        search_deadline = time.monotonic() + WINDOW_SEARCH_TIMEOUT_SECONDS
+        while time.monotonic() < search_deadline:
+            for candidate_window_id in managed_window_ids(x_display):
+                if window_title(x_display, candidate_window_id) == marker_title:
+                    return candidate_window_id
+            time.sleep(WINDOW_SEARCH_POLL_INTERVAL_SECONDS)
+        return None
+    finally:
+        write_to_terminal(terminal_device_path, "\033[23;0t")
+
+
+def badge_colour_from_background(background_colour_hex: str) -> str:
+    """Same hue as the background, but light enough to stand out on the panel."""
+    red, green, blue = (int(background_colour_hex[index : index + 2], 16) / 255 for index in (1, 3, 5))
+    hue, _lightness, saturation = colorsys.rgb_to_hls(red, green, blue)
+    badge_red, badge_green, badge_blue = colorsys.hls_to_rgb(
+        hue, BADGE_LIGHTNESS, max(saturation, BADGE_MINIMUM_SATURATION)
+    )
+    return "#{:02x}{:02x}{:02x}".format(
+        round(badge_red * 255), round(badge_green * 255), round(badge_blue * 255)
+    )
+
+
+def find_terminal_icon_file() -> str | None:
+    try:
+        import gi
+
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk
+
+        icon_theme = Gtk.IconTheme.get_default()
+        for icon_name in TERMINAL_ICON_THEME_NAMES:
+            icon_info = icon_theme.lookup_icon(icon_name, BADGE_ICON_SIZE_PIXELS, 0)
+            if icon_info is not None and icon_info.get_filename():
+                return icon_info.get_filename()
+    except Exception:
+        pass
+    return None
+
+
+def ensure_badge_icon(background_colour_hex: str) -> Path | None:
+    """Return a cached PNG of the terminal icon with a coloured dot, creating it if needed."""
+    badge_colour_hex = badge_colour_from_background(background_colour_hex)
+    badge_icon_path = BADGE_ICON_CACHE_DIRECTORY / f"terminal-badge-{badge_colour_hex.lstrip('#')}.png"
+    if badge_icon_path.is_file():
+        return badge_icon_path
+
+    terminal_icon_file = find_terminal_icon_file()
+    # ImageMagick 7 ships `magick`; 6 (Debian/Ubuntu) only `convert`.
+    image_magick_command = shutil.which("magick") or shutil.which("convert")
+    if terminal_icon_file is None or image_magick_command is None:
+        return None
+
+    BADGE_ICON_CACHE_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    # A dot in the bottom-right quarter with a dark rim, so it reads on any panel.
+    dot_centre = round(BADGE_ICON_SIZE_PIXELS * 0.73)
+    dot_edge = dot_centre - round(BADGE_ICON_SIZE_PIXELS * 0.25)
+    temporary_icon_path = badge_icon_path.with_suffix(f".{os.getpid()}.tmp.png")
+    try:
+        subprocess.run(
+            [
+                image_magick_command, terminal_icon_file,
+                "-resize", f"{BADGE_ICON_SIZE_PIXELS}x{BADGE_ICON_SIZE_PIXELS}",
+                "-fill", badge_colour_hex, "-stroke", "#111111", "-strokewidth", "3",
+                "-draw", f"circle {dot_centre},{dot_centre} {dot_centre},{dot_edge}",
+                str(temporary_icon_path),
+            ],
+            check=True, capture_output=True, timeout=3,
+        )
+        temporary_icon_path.replace(badge_icon_path)  # Atomic, so readers never see half a file.
+    except (OSError, subprocess.SubprocessError):
+        temporary_icon_path.unlink(missing_ok=True)
+        return None
+    return badge_icon_path
+
+
+def nudge_panel_icon_refresh(x_display, window) -> None:
+    """Make Cinnamon re-read the window icon.
+
+    The panel applet only listens for notify::icon, which Muffin emits on
+    _NET_WM_ICON changes. Appending zero items changes nothing but still makes
+    the X server send PropertyNotify.
+    """
+    from Xlib import X, Xatom
+
+    net_wm_icon_atom = x_display.intern_atom("_NET_WM_ICON")
+    if window.get_full_property(net_wm_icon_atom, X.AnyPropertyType) is None:
+        return  # Appending would create an empty icon property; better to skip.
+    window.change_property(net_wm_icon_atom, Xatom.CARDINAL, 32, [], mode=X.PropModeAppend)
+
+
+def set_window_badge(x_display, window_id: int, background_colour_hex: str) -> bool:
+    badge_icon_path = ensure_badge_icon(background_colour_hex)
+    if badge_icon_path is None:
+        return False
+    window = x_display.create_resource_object("window", window_id)
+    window.change_property(
+        x_display.intern_atom("_NET_WM_XAPP_ICON_NAME"),
+        x_display.intern_atom("UTF8_STRING"),
+        8,
+        str(badge_icon_path).encode(),
+    )
+    nudge_panel_icon_refresh(x_display, window)
+    x_display.sync()
+    return True
+
+
+def clear_window_badge(x_display, window_id: int) -> None:
+    window = x_display.create_resource_object("window", window_id)
+    window.delete_property(x_display.intern_atom("_NET_WM_XAPP_ICON_NAME"))
+    nudge_panel_icon_refresh(x_display, window)
+    x_display.sync()
+
+
+# ---------------------------------------------------------------------------
+# Hook entry points
+# ---------------------------------------------------------------------------
+
+
 def handle_session_start(session_id: str, working_directory: str) -> None:
     terminal_device_path, claude_process_id = resolve_terminal_and_claude_process()
-    live_sessions = load_registry(excluding_session_id=session_id)
-    colour_hex, colour_source = choose_colour(
-        session_id, working_directory, live_sessions
-    )
 
-    SESSION_REGISTRY_DIRECTORY.mkdir(parents=True, exist_ok=True)
-    (SESSION_REGISTRY_DIRECTORY / f"{session_id}.json").write_text(
-        json.dumps(
-            {
-                "session_id": session_id,
-                "claude_process_id": claude_process_id,
-                "working_directory": working_directory,
-                "colour_hex": colour_hex,
-                "colour_source": colour_source,
-                "terminal_device_path": terminal_device_path,
-            },
-            indent=2,
+    with registry_lock():
+        live_sessions = load_registry(excluding_session_id=session_id)
+        colour_hex, colour_source = choose_colour(
+            session_id, working_directory, live_sessions
         )
-    )
 
-    # OSC 11 sets the background colour.
-    write_to_terminal(terminal_device_path, f"\033]11;{colour_hex}\007")
+        # OSC 11 sets the background colour.
+        write_to_terminal(terminal_device_path, f"\033]11;{colour_hex}\007")
+
+        window_id: int | None = None
+        owns_badge = False
+        x_display = open_x_display()
+        if x_display is not None:
+            try:
+                window_id = locate_terminal_window(x_display, terminal_device_path)
+                window_already_badged = window_id is not None and any(
+                    registered.window_id == window_id and registered.owns_badge
+                    for registered in live_sessions
+                )
+                if window_id is not None and not window_already_badged:
+                    owns_badge = set_window_badge(x_display, window_id, colour_hex)
+            except Exception:
+                pass  # The badge is optional; the background tint already happened.
+            finally:
+                x_display.close()
+
+        save_registry_entry(
+            RegisteredSession(
+                session_id=session_id,
+                claude_process_id=claude_process_id,
+                working_directory=working_directory,
+                colour_hex=colour_hex,
+                colour_source=colour_source,
+                window_id=window_id,
+                owns_badge=owns_badge,
+                started_at=time.time(),
+            ),
+            terminal_device_path,
+        )
 
 
 def handle_session_end(session_id: str) -> None:
     terminal_device_path, _ = resolve_terminal_and_claude_process()
-    (SESSION_REGISTRY_DIRECTORY / f"{session_id}.json").unlink(missing_ok=True)
-    # OSC 111 resets the background to the terminal profile's own colour.
-    write_to_terminal(terminal_device_path, "\033]111\033\\")
+
+    with registry_lock():
+        own_entry = read_own_registry_entry(session_id)
+        (SESSION_REGISTRY_DIRECTORY / f"{session_id}.json").unlink(missing_ok=True)
+        # OSC 111 resets the background to the terminal profile's own colour.
+        write_to_terminal(terminal_device_path, "\033]111\033\\")
+
+        if own_entry is None or not own_entry.owns_badge or own_entry.window_id is None:
+            return
+
+        x_display = open_x_display()
+        if x_display is None:
+            return
+        try:
+            if not window_exists(x_display, own_entry.window_id):
+                return  # The whole window was closed; nothing left to update.
+
+            # Hand the badge to the longest-running session still in this window.
+            sessions_in_same_window = sorted(
+                (
+                    registered
+                    for registered in load_registry(excluding_session_id=session_id)
+                    if registered.window_id == own_entry.window_id
+                ),
+                key=lambda registered: registered.started_at,
+            )
+            for successor in sessions_in_same_window:
+                if set_window_badge(x_display, own_entry.window_id, successor.colour_hex):
+                    mark_badge_owner(successor.session_id)
+                    return
+            clear_window_badge(x_display, own_entry.window_id)
+        except Exception:
+            pass
+        finally:
+            x_display.close()
 
 
 def main() -> int:
